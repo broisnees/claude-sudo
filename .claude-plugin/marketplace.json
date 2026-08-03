@@ -1,0 +1,11 @@
+{
+  "name": "claude-sudo",
+  "owner": { "name": "Nischal Dahal", "url": "https://github.com/broisnischal" },
+  "plugins": [
+    {
+      "name": "claude-sudo",
+      "source": "./",
+      "description": "A sudo mode for Claude Code: Shift+Tab into it to skip permission prompts and let sudo authenticate from a password held in the OS keyring, with a policy guard and an audit log."
+    }
+  ]
+}

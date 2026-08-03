@@ -1,0 +1,565 @@
+#!/usr/bin/env bash
+# claude-sudo — a sudo mode for Claude Code.
+#
+#   claude-sudo setup            store your sudo password in the OS keyring, wire the hooks
+#   claude-sudo launch [args]    start Claude Code with sudo mode already armed
+#   claude-sudo on|off|status    arm / disarm / inspect sudo mode for a session
+#   claude-sudo audit            what sudo mode has actually done
+#   claude-sudo doctor           end-to-end check, including a real sudo authentication
+set -uo pipefail
+
+_bin=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$_bin/../lib/common.sh"
+# shellcheck source=../lib/vault.sh
+. "$_bin/../lib/vault.sh"
+# shellcheck source=../lib/policy.sh
+. "$_bin/../lib/policy.sh"
+
+cs_colors
+ok()    { printf '  %s✔%s %s\n' "$CS_GREEN" "$CS_RST" "$*"; }
+bad()   { printf '  %s✖%s %s\n' "$CS_RED" "$CS_RST" "$*"; }
+warn_() { printf '  %s!%s %s\n' "$CS_YELLOW" "$CS_RST" "$*"; }
+info()  { printf '  %s·%s %s\n' "$CS_DIM" "$CS_RST" "$*"; }
+head_() { printf '\n%s%s%s\n' "$CS_BOLD" "$*" "$CS_RST"; }
+
+usage() {
+  cat <<'EOF'
+claude-sudo — sudo mode for Claude Code
+
+  setup [--stdin] [--backend NAME]   store the sudo password, wire hooks, verify
+  launch [claude args...]            start Claude Code with sudo mode armed
+  on [--ttl MIN] [--session ID]      arm sudo mode for a running session
+  off [--session ID]                 disarm it
+  status [--session ID]              show mode, vault backend, wiring
+  toggle [on|off|status]             what the /sudo slash command calls
+  passwd [--stdin]                   replace the stored password
+  forget                             delete the stored password
+  audit [-n N] [-f]                  audit log (every privileged command)
+  policy                             show the active guardrails
+  doctor                             full check, authenticates against sudo once
+  hooks install|uninstall|status     manage the Claude Code wiring
+  autoarm on|off|status              arm every new session automatically
+  statusline install|uninstall       show sudo mode in the status line
+  modes show|set <mode,...>|off      which Shift+Tab modes arm sudo mode
+  update                             pull the latest version
+  version
+
+Shift+Tab into "bypass permissions" arms sudo mode; leaving that mode disarms it.
+Sudo mode expires on its own (default TTL 480m, set CLAUDE_SUDO_TTL) and never
+survives the session that armed it.
+EOF
+}
+
+require_jq() { command -v jq >/dev/null 2>&1 || cs_die "jq is required (pacman -S jq / apt install jq / brew install jq)"; }
+
+# ---------------------------------------------------------------- password ---
+
+read_password() { # prints the password on stdout
+  local from_stdin=${1:-0} pw pw2
+  if [ "$from_stdin" = 1 ]; then
+    IFS= read -r pw || true
+    printf '%s' "$pw"; return 0
+  fi
+  if [ "${CLAUDECODE:-0}" = 1 ]; then
+    cs_die "refusing to read a password from inside a Claude Code session.
+  Run 'claude-sudo setup' in your own terminal, or pipe it: printf '%s' \"\$PW\" | claude-sudo setup --stdin"
+  fi
+  [ -r /dev/tty ] || cs_die "no terminal to read the password from; use --stdin"
+  printf 'sudo password for %s@%s: ' "$CS_ACCOUNT" "$CS_HOSTNAME" >/dev/tty
+  IFS= read -rs pw </dev/tty; printf '\n' >/dev/tty
+  printf 'again: ' >/dev/tty
+  IFS= read -rs pw2 </dev/tty; printf '\n' >/dev/tty
+  [ "$pw" = "$pw2" ] || cs_die "the two entries did not match"
+  printf '%s' "$pw"
+}
+
+store_password() {
+  local from_stdin=${1:-0} pw backend
+  backend=$(cs_vault_backend)
+  [ "$backend" = none ] && cs_die "no secret store available. Install one of: libsecret (secret-tool), pass, gnupg"
+  pw=$(read_password "$from_stdin")
+  [ -n "$pw" ] || cs_die "empty password"
+
+  if printf '%s' "$pw" | cs_verify_password; then
+    ok "password verified against sudo"
+  else
+    cs_die "sudo rejected that password — nothing stored"
+  fi
+  if printf '%s' "$pw" | cs_vault_store; then
+    ok "stored in the $backend keyring (never written to disk in plaintext)"
+    # Sessions that gave up on arming because there was no password can retry.
+    rm -f "$CS_STATE"/no-password.* 2>/dev/null || true
+    cs_log vault-store "backend=$backend" "account=$CS_ACCOUNT"
+  else
+    cs_die "could not store the password in the $backend keyring"
+  fi
+  unset pw
+}
+
+# ------------------------------------------------------------------- hooks ---
+
+# Keep a few settings backups, not one per re-run.
+prune_backups() {
+  local keep=5 f
+  # shellcheck disable=SC2012
+  ls -1t "$CS_SETTINGS.claude-sudo-backup."* 2>/dev/null | tail -n "+$((keep + 1))" | while IFS= read -r f; do
+    [ -n "$f" ] && rm -f "$f"
+  done
+}
+
+hooks_wired() {
+  # A plugin install gets its hooks from the plugin manifest, not from settings.
+  cs_is_plugin_install && return 0
+  # Match the real script path, not the string "claude-sudo": the install
+  # directory does not have to be named that (--prefix ~/tools/cs is legal).
+  [ -f "$CS_SETTINGS" ] && grep -qF "$CS_ROOT/hooks/gate.sh" "$CS_SETTINGS" 2>/dev/null
+}
+
+hooks_install() {
+  require_jq
+  if cs_is_plugin_install; then
+    ok "installed as a Claude Code plugin — hooks come from the plugin manifest"
+    return 0
+  fi
+  local gate="bash \"$CS_ROOT/hooks/gate.sh\"" send="bash \"$CS_ROOT/hooks/session-end.sh\"" \
+        sstart="bash \"$CS_ROOT/hooks/session-start.sh\"" tmp bak
+  mkdir -p "$(dirname -- "$CS_SETTINGS")"
+  [ -f "$CS_SETTINGS" ] || printf '{}\n' >"$CS_SETTINGS"
+  jq -e . "$CS_SETTINGS" >/dev/null 2>&1 || cs_die "$CS_SETTINGS is not valid JSON — fix it first"
+  bak="$CS_SETTINGS.claude-sudo-backup.$(date +%Y%m%d%H%M%S)"
+  cp -p "$CS_SETTINGS" "$bak" || cs_die "could not back up $CS_SETTINGS"
+  prune_backups
+  tmp=$(mktemp "${TMPDIR:-/tmp}/claude-sudo-settings.XXXXXX") || cs_die "mktemp failed"
+  jq --arg gate "$gate" --arg send "$send" --arg sstart "$sstart" --arg root "$CS_ROOT" '
+    # Ours = anything pointing into this install, plus anything from a previous
+    # install of claude-sudo somewhere else, so re-wiring never duplicates.
+    def mine(c): (c // "") | (contains($root) or contains("claude-sudo"));
+    def clean(a):
+      (a // [])
+      | map(.hooks = ((.hooks // []) | map(select(mine(.command) | not))))
+      | map(select((.hooks | length) > 0));
+    .hooks = (.hooks // {})
+    | .hooks.PreToolUse   = (clean(.hooks.PreToolUse)   + [{hooks:[{type:"command",command:$gate}]}])
+    | .hooks.SessionStart = (clean(.hooks.SessionStart) + [{hooks:[{type:"command",command:$sstart}]}])
+    | .hooks.SessionEnd   = (clean(.hooks.SessionEnd)   + [{hooks:[{type:"command",command:$send}]}])
+  ' "$CS_SETTINGS" >"$tmp" || { rm -f "$tmp"; cs_die "failed to patch $CS_SETTINGS"; }
+  jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; cs_die "patched settings were invalid; left $CS_SETTINGS untouched"; }
+  cat "$tmp" >"$CS_SETTINGS" && rm -f "$tmp"
+  ok "hooks wired into $CS_SETTINGS (backup: $(basename -- "$bak"))"
+
+  local cmddir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/commands"
+  mkdir -p "$cmddir"
+  # The slash command runs the CLI by absolute path, so it works whether or not
+  # the symlink dir made it onto PATH.
+  if sed "s|__CLAUDE_SUDO_BIN__|$CS_ROOT/bin/claude-sudo|g" \
+       "$CS_ROOT/commands/sudo.md" >"$cmddir/sudo.md" 2>/dev/null; then
+    ok "/sudo slash command installed"
+  fi
+  cs_log hooks-install "settings=$CS_SETTINGS"
+}
+
+hooks_uninstall() {
+  require_jq
+  local tmp
+  [ -f "$CS_SETTINGS" ] || { info "no settings file"; return 0; }
+  tmp=$(mktemp "${TMPDIR:-/tmp}/claude-sudo-settings.XXXXXX") || cs_die "mktemp failed"
+  jq --arg root "$CS_ROOT" '
+    def mine(c): (c // "") | (contains($root) or contains("claude-sudo"));
+    def clean(a):
+      (a // [])
+      | map(.hooks = ((.hooks // []) | map(select(mine(.command) | not))))
+      | map(select((.hooks | length) > 0));
+    if .hooks then
+      .hooks.PreToolUse = clean(.hooks.PreToolUse)
+      | .hooks.SessionStart = clean(.hooks.SessionStart)
+      | .hooks.SessionEnd = clean(.hooks.SessionEnd)
+    else . end
+  ' "$CS_SETTINGS" >"$tmp" && jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; cs_die "failed to clean $CS_SETTINGS"; }
+  cat "$tmp" >"$CS_SETTINGS" && rm -f "$tmp"
+  rm -f "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/commands/sudo.md"
+  ok "hooks removed from $CS_SETTINGS"
+  cs_log hooks-uninstall
+}
+
+# -------------------------------------------------------------- statusline ---
+
+CS_STATUSLINE="$CS_ROOT/bin/claude-sudo-statusline"
+
+statusline_wired() {
+  [ -f "$CS_SETTINGS" ] || return 1
+  jq -e '(.statusLine.command // "") | contains("claude-sudo-statusline")' "$CS_SETTINGS" >/dev/null 2>&1
+}
+
+statusline_install() {
+  require_jq
+  local cmd="bash \"$CS_STATUSLINE\"" tmp prev
+  [ -f "$CS_SETTINGS" ] || printf '{}\n' >"$CS_SETTINGS"
+  if statusline_wired; then ok "statusline already wired"; return 0; fi
+  cs_init_dirs
+  # Keep whatever renderer is there now and run it from inside the wrapper.
+  prev=$(jq -r '.statusLine.command // ""' "$CS_SETTINGS" 2>/dev/null)
+  if [ -n "$prev" ]; then
+    printf '%s\n' "$prev" >"$CS_CONFIG/statusline-inner"
+    jq -c '.statusLine // {}' "$CS_SETTINGS" >"$CS_CONFIG/statusline-inner.json"
+    ok "kept your current statusline and will render it inside the wrapper"
+  fi
+  cp -p "$CS_SETTINGS" "$CS_SETTINGS.claude-sudo-backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+  prune_backups
+  tmp=$(mktemp "${TMPDIR:-/tmp}/claude-sudo-settings.XXXXXX") || cs_die "mktemp failed"
+  jq --arg c "$cmd" '.statusLine = {type:"command", command:$c}' "$CS_SETTINGS" >"$tmp" \
+    && jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; cs_die "failed to patch statusLine"; }
+  cat "$tmp" >"$CS_SETTINGS" && rm -f "$tmp"
+  ok "statusline wired — sudo mode shows as [SUDO ⏵⏵]"
+  cs_log statusline-install
+}
+
+statusline_uninstall() {
+  require_jq
+  local tmp restore
+  [ -f "$CS_SETTINGS" ] || return 0
+  statusline_wired || { info "statusline is not ours; leaving it alone"; return 0; }
+  restore=$(cat "$CS_CONFIG/statusline-inner.json" 2>/dev/null)
+  tmp=$(mktemp "${TMPDIR:-/tmp}/claude-sudo-settings.XXXXXX") || cs_die "mktemp failed"
+  if [ -n "$restore" ] && [ "$restore" != '{}' ]; then
+    jq --argjson s "$restore" '.statusLine = $s' "$CS_SETTINGS" >"$tmp"
+  else
+    jq 'del(.statusLine)' "$CS_SETTINGS" >"$tmp"
+  fi
+  jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; cs_die "failed to restore statusLine"; }
+  cat "$tmp" >"$CS_SETTINGS" && rm -f "$tmp"
+  rm -f "$CS_CONFIG/statusline-inner" "$CS_CONFIG/statusline-inner.json"
+  ok "statusline restored"
+  cs_log statusline-uninstall
+}
+
+# -------------------------------------------------------------- arm/disarm ---
+
+resolve_session() {
+  local sid=${1:-}
+  [ -n "$sid" ] || sid=$(cs_current_session)
+  printf '%s' "$sid"
+}
+
+cmd_on() {
+  local ttl=$CS_DEFAULT_TTL sid=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --ttl) ttl=${2:-}; shift 2 ;;
+      --session) sid=${2:-}; shift 2 ;;
+      *) cs_die "unknown option: $1" ;;
+    esac
+  done
+  sid=$(resolve_session "$sid")
+  [ -n "$sid" ] || cs_die "no session id. Inside Claude Code use /sudo on; outside use 'claude-sudo launch'."
+  cs_vault_has || cs_die "no password stored yet — run 'claude-sudo setup' in your own terminal first"
+  hooks_wired || cs_warn "hooks are not wired yet; run 'claude-sudo hooks install'"
+  local exp; exp=$(cs_arm "$sid" "$ttl") || cs_die "could not arm session $sid"
+  cs_log arm "session=$sid" "ttl=${ttl}m" "expires=$exp"
+  printf 'sudo mode ON for this session (%s). Permission prompts are skipped and sudo authenticates from the keyring.\n' \
+    "$(cs_fmt_expiry "$exp")"
+}
+
+cmd_off() {
+  local sid=
+  [ "${1:-}" = --session ] && { sid=${2:-}; shift 2; }
+  sid=$(resolve_session "$sid")
+  [ -n "$sid" ] || cs_die "no session id"
+  if cs_disarm "$sid"; then
+    cs_log disarm "session=$sid" source=manual
+    printf 'sudo mode OFF for this session. Permission prompts are back.\n'
+  else
+    printf 'sudo mode was already off for this session.\n'
+  fi
+}
+
+cmd_status() {
+  local sid exp backend
+  sid=$(resolve_session "${2:-}")
+  backend=$(cs_vault_backend)
+  head_ "claude-sudo $CLAUDE_SUDO_VERSION"
+  if exp=$(cs_expiry "$sid"); then ok "sudo mode ARMED — $(cs_fmt_expiry "$exp")"
+  else bad "sudo mode off${sid:+ for session ${sid:0:8}}"; fi
+  if [ "$backend" = none ]; then bad "no secret store available"
+  elif cs_vault_has; then ok "password stored ($backend)"
+  else bad "no password stored ($backend backend) — run: claude-sudo setup"; fi
+  if hooks_wired; then ok "hooks wired ($CS_SETTINGS)"; else bad "hooks not wired — run: claude-sudo hooks install"; fi
+  if cs_autoarm_on; then
+    ok "auto-arm ON — every new session starts in sudo mode"
+  else
+    info "auto-arm off — turn it on with: claude-sudo autoarm on"
+  fi
+  local modes; modes=$(cs_arm_modes | paste -sd, - 2>/dev/null)
+  if [ -n "$modes" ] && [ "$modes" != none ]; then
+    ok "Shift+Tab arms sudo mode in: $modes  (policy 'ask' there → $(cs_ask_in_bypass))"
+  else
+    info "Shift+Tab coupling disabled — arm with /sudo on"
+  fi
+  if statusline_wired; then ok "statusline shows [SUDO ⏵⏵]"; else info "statusline badge off — run: claude-sudo statusline install"; fi
+  info "install root: $CS_ROOT"
+  info "audit log:    $CS_AUDIT ($( [ -f "$CS_AUDIT" ] && wc -l <"$CS_AUDIT" || printf 0) lines)"
+  info "policy:       $(cs_policy_file)"
+  local n; n=$(cs_reap; ls -1 "$CS_SESSIONS" 2>/dev/null | wc -l)
+  info "armed sessions: $n"
+  printf '\n'
+}
+
+# Deterministic entry point for the /sudo slash command: always exits 0 and
+# prints one line, so the model gets a clean signal either way.
+cmd_toggle() {
+  local arg=${1:-status} out
+  case $arg in
+    on|ON|1)   out=$(cmd_on 2>&1)  || true; printf '%s\n' "$out" ;;
+    off|OFF|0) out=$(cmd_off 2>&1) || true; printf '%s\n' "$out" ;;
+    *)
+      local sid exp; sid=$(cs_current_session)
+      if exp=$(cs_expiry "$sid"); then printf 'sudo mode is ON (%s)\n' "$(cs_fmt_expiry "$exp")"
+      else printf 'sudo mode is OFF\n'; fi ;;
+  esac
+  exit 0
+}
+
+# ------------------------------------------------------------------ launch ---
+
+cmd_launch() {
+  local ttl=$CS_DEFAULT_TTL claude_bin exp
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --ttl) ttl=${2:-}; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  claude_bin=$(command -v claude 2>/dev/null) || cs_die "claude is not on PATH"
+  cs_vault_has || cs_die "no password stored — run 'claude-sudo setup' first"
+  hooks_wired || cs_warn "hooks are not wired; run 'claude-sudo hooks install' or sudo mode will do nothing"
+  cs_is_uint "$ttl" || ttl=$CS_DEFAULT_TTL
+  if [ "$ttl" -eq 0 ]; then exp=0; else exp=$(( $(cs_now) + ttl * 60 )); fi
+  cs_init_dirs
+  cs_log launch "ttl=${ttl}m" "expires=$exp"
+  printf '\033[2mclaude-sudo: sudo mode armed (%s) — audit: %s\033[0m\n' "$(cs_fmt_expiry "$exp")" "$CS_AUDIT"
+  export CLAUDE_SUDO_ARMED=1 CLAUDE_SUDO_EXPIRES="$exp" SUDO_ASKPASS="$CS_ASKPASS"
+  export PATH="$CS_SHIM:$PATH"
+  exec "$claude_bin" "$@"
+}
+
+# ------------------------------------------------------------------ doctor ---
+
+cmd_doctor() {
+  local backend rc=0
+  head_ "claude-sudo doctor"
+  command -v jq >/dev/null 2>&1 && ok "jq present" || { bad "jq missing (required)"; rc=1; }
+  command -v sudo >/dev/null 2>&1 && ok "sudo present ($(sudo -V 2>/dev/null | head -1))" || { bad "sudo missing"; rc=1; }
+  backend=$(cs_vault_backend)
+  if [ "$backend" = none ]; then bad "no secret store available"; rc=1; else ok "vault backend: $backend"; fi
+  [ -x "$CS_ASKPASS" ] && ok "askpass helper executable" || { bad "askpass not executable: $CS_ASKPASS"; rc=1; }
+  [ -x "$CS_SHIM/sudo" ] && ok "sudo shim executable" || { bad "sudo shim not executable: $CS_SHIM/sudo"; rc=1; }
+  hooks_wired && ok "hooks wired" || { bad "hooks not wired (claude-sudo hooks install)"; rc=1; }
+  if cs_vault_has; then ok "password readable from the $backend keyring"; else bad "cannot read a stored password (claude-sudo setup)"; rc=1; fi
+
+  if sudo -n -v >/dev/null 2>&1; then
+    info "sudo is already passwordless for you (NOPASSWD or a fresh cache) — the stored password is only a fallback"
+  fi
+
+  # Real end-to-end authentication: arm a throwaway session, force a fresh
+  # timestamp, and make sudo authenticate through the askpass helper.
+  local sid="doctor-$$" exp
+  exp=$(cs_arm "$sid" 1) >/dev/null
+  if CLAUDE_SUDO_SESSION="$sid" SUDO_ASKPASS="$CS_ASKPASS" \
+     timeout 20 sudo -A -k -v >/dev/null 2>&1; then
+    ok "end-to-end: sudo authenticated with the stored password, no prompt"
+  else
+    bad "end-to-end: sudo could not authenticate through the askpass helper"
+    info "check '$CS_AUDIT' — and whether your keyring is unlocked"
+    rc=1
+  fi
+  cs_disarm "$sid" 2>/dev/null
+  local counts; counts=$(cs_policy_count)
+  info "policy: ${counts% *} refuse rules, ${counts#* } ask rules"
+  if [ "$rc" -eq 0 ]; then
+    printf '\n  %sReady.%s Shift+Tab into "bypass permissions" to arm sudo mode.\n\n' "$CS_GREEN" "$CS_RST"
+  else
+    printf '\n  %sNot ready yet%s — fix the ✖ lines above, then run claude-sudo doctor again.\n\n' "$CS_YELLOW" "$CS_RST"
+  fi
+  return "$rc"
+}
+
+# ------------------------------------------------------------------- audit ---
+
+cmd_audit() {
+  local n=40 follow=0 raw=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -n) n=${2:-40}; shift 2 ;;
+      -f|--follow) follow=1; shift ;;
+      --raw) raw=1; shift ;;
+      *) cs_die "unknown option: $1" ;;
+    esac
+  done
+  [ -f "$CS_AUDIT" ] || { printf 'no audit log yet: %s\n' "$CS_AUDIT"; return 0; }
+  if [ "$raw" = 1 ]; then
+    if [ "$follow" = 1 ]; then tail -n "$n" -f "$CS_AUDIT"; else tail -n "$n" "$CS_AUDIT"; fi
+    return 0
+  fi
+  # Readable view: time, event, and the part that matters for that event.
+  cs_audit_fmt() {
+    local red=$CS_RED green=$CS_GREEN yellow=$CS_YELLOW dim=$CS_DIM rst=$CS_RST
+    awk -v red="$red" -v green="$green" -v yellow="$yellow" -v dim="$dim" -v rst="$rst" '
+      {
+        ts=""; ev=""; detail=""; cmd=""; reason=""; mode=""
+        line=$0
+        if (match(line, /ts=[^ ]+/))     ts=substr(line, RSTART+3, RLENGTH-3)
+        if (match(line, /event=[^ ]+/))  ev=substr(line, RSTART+6, RLENGTH-6)
+        if (match(line, /mode=[^ ]+/))   mode=substr(line, RSTART+5, RLENGTH-5)
+        if (match(line, /reason=.*/))  { reason=substr(line, RSTART+7); sub(/ cmd=.*/, "", reason) }
+        if (match(line, /cmd=.*/))       cmd=substr(line, RSTART+4)
+        gsub(/^[0-9]{4}-[0-9]{2}-[0-9]{2}T/, "", ts); gsub(/Z$/, "", ts)
+        color=dim
+        if (ev ~ /deny/)                     color=red
+        else if (ev ~ /^askpass-served$/)    color=yellow
+        else if (ev ~ /^(arm|launch)$/)      color=green
+        detail = cmd
+        if (detail == "") detail = reason
+        if (detail == "" && mode != "") detail = "mode=" mode
+        if (ev ~ /deny/ && reason != "" && cmd != "") detail = reason ": " cmd
+        printf "  %s%-8s%s %s%-22s%s %s\n", dim, ts, rst, color, ev, rst, detail
+      }'
+  }
+  if [ "$follow" = 1 ]; then tail -n "$n" -f "$CS_AUDIT" | cs_audit_fmt
+  else tail -n "$n" "$CS_AUDIT" | cs_audit_fmt; fi
+}
+
+cmd_policy() {
+  local f; f=$(cs_policy_file)
+  printf 'active policy: %s\n\n' "$f"
+  grep -vE '^\s*(#|$)' "$f" | while IFS=$'\t' read -r action re reason; do
+    printf '  %-4s %s\n       \033[2m%s\033[0m\n' "$action" "$reason" "$re"
+  done
+}
+
+# --------------------------------------------------------------------- main ---
+
+case "$(basename -- "$0")" in
+  csudo) set -- launch "$@" ;;
+esac
+
+sub=${1:-status}; shift 2>/dev/null || true
+case $sub in
+  setup)
+    local_stdin=0; backend=
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --stdin) local_stdin=1; shift ;;
+        --backend) backend=${2:-}; shift 2 ;;
+        *) cs_die "unknown option: $1" ;;
+      esac
+    done
+    head_ "claude-sudo setup"
+    require_jq
+    cs_init_dirs || cs_die "could not create $CS_STATE"
+    [ -n "$backend" ] && { cs_vault_set_backend "$backend"; ok "backend pinned to $backend"; }
+    store_password "$local_stdin"
+    hooks_wired || hooks_install
+    hooks_wired && ok "hooks wired"
+    statusline_wired || statusline_install
+    "$0" autoarm ask
+    cat <<EOF
+
+Ways to turn sudo mode on:
+
+  automatically                       every new session, if you chose that above
+  Shift+Tab to "bypass permissions"   arms it; cycling out of that mode disarms
+  /sudo on                            arm this session explicitly (/sudo off)
+  claude-sudo launch                  start Claude Code already armed
+
+Then check it works:  claude-sudo doctor
+EOF
+    ;;
+  launch|run) cmd_launch "$@" ;;
+  on|arm) cmd_on "$@" ;;
+  off|disarm) cmd_off "$@" ;;
+  status) cmd_status "$@" ;;
+  toggle) cmd_toggle "${1:-status}" ;;
+  passwd|password) head_ "claude-sudo passwd"; store_password "$( [ "${1:-}" = --stdin ] && printf 1 || printf 0)" ;;
+  forget)
+    if cs_vault_clear; then cs_log vault-clear; ok "stored password deleted from the $(cs_vault_backend) keyring"
+    else cs_die "nothing to delete, or the keyring refused"; fi ;;
+  audit) cmd_audit "$@" ;;
+  policy) cmd_policy ;;
+  doctor) cmd_doctor ;;
+  hooks)
+    case ${1:-status} in
+      install) hooks_install ;;
+      uninstall|remove) hooks_uninstall ;;
+      status) hooks_wired && ok "wired" || bad "not wired" ;;
+      *) cs_die "hooks: expected install|uninstall|status" ;;
+    esac ;;
+  statusline)
+    case ${1:-status} in
+      install) statusline_install ;;
+      uninstall|remove) statusline_uninstall ;;
+      status) statusline_wired && ok "wired" || bad "not wired" ;;
+      *) cs_die "statusline: expected install|uninstall|status" ;;
+    esac ;;
+  autoarm|auto)
+    case ${1:-status} in
+      on|enable)
+        cs_init_dirs; printf 'on\n' >"$CS_CONFIG/autoarm"
+        rm -f "$CS_STATE"/no-password.* 2>/dev/null || true
+        cs_log autoarm on
+        ok "auto-arm ON — every new Claude Code session starts in sudo mode"
+        cs_vault_has || warn_ "no password stored yet, so it cannot arm — run: claude-sudo passwd"
+        info "already-running sessions are unaffected; new ones pick it up immediately" ;;
+      off|disable)
+        cs_init_dirs; printf 'off\n' >"$CS_CONFIG/autoarm"
+        cs_log autoarm off
+        ok "auto-arm OFF — arm with Shift+Tab or /sudo on" ;;
+      status)
+        if cs_autoarm_on; then ok "auto-arm is ON"; else info "auto-arm is off"; fi ;;
+      ask)
+        # The choice, asked once at install time.
+        if [ ! -r /dev/tty ] || [ "${CLAUDECODE:-0}" = 1 ]; then
+          info "auto-arm left off — turn it on later with: claude-sudo autoarm on"
+        else
+          printf '\n  %sArm sudo mode automatically in every new session?%s\n' "$CS_BOLD" "$CS_RST"
+          info "yes: no prompts and passwordless sudo from the first message, every session"
+          info "no:  arm per session with Shift+Tab or /sudo on  (you can change this anytime)"
+          printf '  [y/N] ' >/dev/tty
+          IFS= read -r ans </dev/tty || ans=
+          case ${ans:-n} in
+            y|Y|yes|YES) cs_init_dirs; printf 'on\n' >"$CS_CONFIG/autoarm"; cs_log autoarm on
+                         ok "auto-arm ON — every new session starts in sudo mode" ;;
+            *)           cs_init_dirs; printf 'off\n' >"$CS_CONFIG/autoarm"
+                         ok "auto-arm off — Shift+Tab into \"bypass permissions\" when you want it" ;;
+          esac
+        fi ;;
+      *) cs_die "autoarm: expected on|off|status|ask" ;;
+    esac ;;
+  modes)
+    case ${1:-show} in
+      show) cs_arm_modes ;;
+      set) shift; cs_init_dirs; printf '%s\n' "${*:-bypassPermissions}" | tr ', ' '\n' | grep -v '^$' >"$CS_CONFIG/arm-modes"
+           ok "sudo mode now arms in: $(cs_arm_modes | paste -sd, -)" ;;
+      off) cs_init_dirs; printf 'none\n' >"$CS_CONFIG/arm-modes"; ok "Shift+Tab coupling disabled" ;;
+      *) cs_die "modes: expected show|set <mode,...>|off" ;;
+    esac ;;
+  update|upgrade)
+    head_ "claude-sudo update"
+    [ -d "$CS_ROOT/.git" ] || cs_die "$CS_ROOT is not a git checkout — reinstall with the one-line installer to enable updates"
+    command -v git >/dev/null 2>&1 || cs_die "git is not installed"
+    before=$CLAUDE_SUDO_VERSION
+    git -C "$CS_ROOT" fetch --depth 1 -q origin HEAD || cs_die "could not reach the remote"
+    git -C "$CS_ROOT" reset --hard -q FETCH_HEAD || cs_die "could not apply the update"
+    after=$(sed -n 's/^CLAUDE_SUDO_VERSION="\(.*\)"/\1/p' "$CS_ROOT/lib/common.sh" | head -1)
+    chmod 755 "$CS_ROOT/bin/"* "$CS_ROOT/libexec/claude-sudo-askpass" \
+              "$CS_ROOT/libexec/shim/sudo" "$CS_ROOT/hooks/"*.sh 2>/dev/null || true
+    if [ "$before" = "$after" ]; then ok "already current ($after)"; else ok "updated $before → $after"; fi
+    hooks_wired || hooks_install
+    cs_log update "from=$before" "to=$after"
+    info "run 'claude-sudo doctor' if anything looks off"
+    printf '\n' ;;
+  askpass) exec "$CS_ASKPASS" "$@" ;;
+  version|--version|-v) printf 'claude-sudo %s\n' "$CLAUDE_SUDO_VERSION" ;;
+  help|--help|-h) usage ;;
+  *) usage; exit 1 ;;
+esac

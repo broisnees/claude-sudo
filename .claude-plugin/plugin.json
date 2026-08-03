@@ -1,0 +1,7 @@
+{
+  "name": "claude-sudo",
+  "description": "A sudo mode for Claude Code: skip permission prompts and let sudo authenticate from a password held in the OS keyring, with a policy guard and an audit log.",
+  "version": "1.0.0",
+  "author": { "name": "Nischal Dahal" },
+  "keywords": ["sudo", "permissions", "keyring", "audit"]
+}

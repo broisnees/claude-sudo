@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# claude-sudo askpass helper. sudo(8) execs this via SUDO_ASKPASS and reads the
+# password from stdout. Nothing else should ever get a password out of it:
+#   * it refuses unless sudo mode is armed for the current session
+#   * it refuses unless its parent process is sudo/sudoedit
+#   * every served and every refused request lands in the audit log
+set -uo pipefail
+
+_here=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$_here/../lib/common.sh"
+# shellcheck source=../lib/vault.sh
+. "$_here/../lib/vault.sh"
+
+sid=$(cs_current_session)
+
+if ! cs_armed "$sid"; then
+  cs_log askpass-refused reason=not-armed "session=${sid:-none}"
+  printf 'claude-sudo: sudo mode is not armed for this session (run: claude-sudo on)\n' >&2
+  exit 1
+fi
+
+parent=$(ps -o comm= -p "$PPID" 2>/dev/null | tr -d ' \t')
+[ -n "$parent" ] || parent=$(tr -d '\0\n' <"/proc/$PPID/comm" 2>/dev/null || printf '')
+case $parent in
+  sudo|sudoedit) : ;;
+  '')
+    if [ "${CLAUDE_SUDO_ALLOW_UNKNOWN_PARENT:-0}" != 1 ]; then
+      cs_log askpass-refused reason=unknown-parent "ppid=$PPID"
+      exit 1
+    fi ;;
+  *)
+    cs_log askpass-refused reason="parent=$parent" "ppid=$PPID"
+    exit 1 ;;
+esac
+
+if ! pw=$(cs_vault_get); then
+  cs_log askpass-failed reason=vault-unavailable "backend=$(cs_vault_backend)"
+  printf 'claude-sudo: could not read the password from the %s vault\n' "$(cs_vault_backend)" >&2
+  exit 1
+fi
+
+cs_log askpass-served "session=${sid:-none}" "ppid=$PPID" "prompt=${1:-}"
+printf '%s\n' "$pw"

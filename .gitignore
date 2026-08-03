@@ -1,0 +1,8 @@
+# nothing generated lives in the repo — state goes to $XDG_STATE_HOME/claude-sudo
+*.log
+*.bak
+*.old.*
+.DS_Store
+
+# local Claude Code session scratch, not part of the project
+.claude/

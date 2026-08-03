@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# claude-sudo statusLine renderer.
+#
+# statusLine is ONE command, so this wraps whatever you had before: it prepends
+# a badge and pipes the untouched session JSON into your previous renderer,
+# recorded at $CS_CONFIG/statusline-inner by `claude-sudo statusline install`.
+# Fires several times a second — one jq pass, no keyring reads, no subshell loops.
+#
+#   [SUDO ⏵⏵]  armed: prompts are skipped and sudo authenticates from the keyring
+#   [SUDO ✗]   in an arming permission mode but no password stored — sudo will fail
+set -uo pipefail
+
+_bin=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$_bin/../lib/common.sh"
+
+in=$(cat)
+
+sid=; mode=
+if command -v jq >/dev/null 2>&1; then
+  IFS=$'\x1f' read -r sid mode < <(
+    printf '%s' "$in" | jq -r '[(.session_id // ""),(.permission_mode // "")] | join("")' 2>/dev/null
+  ) || true
+fi
+
+# Force colours: stdout is a pipe here, but Claude Code renders it in a terminal.
+cs_colors force
+badge=
+
+if exp=$(cs_expiry "$sid" 2>/dev/null); then
+  if [ "$exp" = 0 ]; then badge="${CS_RED}[SUDO ⏵⏵]${CS_RST}"
+  else badge="${CS_RED}[SUDO ⏵⏵ $(( (exp - $(cs_now) + 59) / 60 ))m]${CS_RST}"; fi
+elif [ -n "$mode" ]; then
+  # In a mode that would arm sudo mode, but it did not arm: say so, because the
+  # built-in indicator will claim nothing needs approval while sudo still fails.
+  while IFS= read -r m || [ -n "$m" ]; do
+    [ -n "$m" ] && [ "$m" != none ] && [ "$m" = "$mode" ] && { badge="${CS_DIM}[SUDO ✗]${CS_RST}"; break; }
+  done < <(cs_arm_modes)
+fi
+
+[ -n "$badge" ] && printf '%b ' "$badge"
+
+inner=
+[ -f "$CS_CONFIG/statusline-inner" ] && inner=$(cat "$CS_CONFIG/statusline-inner" 2>/dev/null)
+if [ -n "$inner" ]; then
+  printf '%s' "$in" | eval "$inner"
+elif [ -n "$badge" ]; then
+  printf '%s' "$(printf '%s' "$in" | jq -r '(.workspace.current_dir // .cwd // "") | split("/") | last' 2>/dev/null)"
+fi

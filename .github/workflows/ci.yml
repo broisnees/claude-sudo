@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq libsecret-tools gnome-keyring dbus-x11 shellcheck
+
+      - name: Shell syntax
+        run: |
+          for f in bin/claude-sudo bin/claude-sudo-statusline install.sh uninstall.sh \
+                   hooks/*.sh lib/*.sh libexec/claude-sudo-askpass libexec/shim/sudo tests/smoke.sh; do
+            bash -n "$f" || exit 1
+          done
+
+      - name: Shellcheck
+        run: |
+          shellcheck -S warning -e SC1090,SC1091 \
+            bin/claude-sudo bin/claude-sudo-statusline install.sh uninstall.sh \
+            hooks/*.sh lib/*.sh libexec/claude-sudo-askpass libexec/shim/sudo
+
+      - name: JSON manifests
+        run: |
+          jq -e . hooks/hooks.json
+          jq -e . .claude-plugin/plugin.json
+          jq -e . .claude-plugin/marketplace.json
+
+      # An unlocked keyring, so the vault-backed tests run for real rather than
+      # taking the graceful skip.
+      - name: Smoke tests
+        run: |
+          export $(dbus-launch)
+          echo -n '' | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1 || true
+          eval "$(echo -n '' | gnome-keyring-daemon --start --components=secrets 2>/dev/null)" || true
+          export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+          bash tests/smoke.sh
+
+      - name: Version is consistent
+        run: |
+          lib=$(sed -n 's/^CLAUDE_SUDO_VERSION="\(.*\)"/\1/p' lib/common.sh | head -1)
+          plugin=$(jq -r .version .claude-plugin/plugin.json)
+          echo "lib=$lib plugin=$plugin"
+          [ "$lib" = "$plugin" ]

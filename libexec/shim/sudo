@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# claude-sudo sudo(1) shim. Only ever reached when this directory is first on
+# PATH, which claude-sudo arranges exclusively for armed Claude Code sessions.
+#
+# It adds -A so sudo authenticates through the askpass helper instead of trying
+# to prompt on a terminal Claude cannot see (which is what makes plain `sudo`
+# hang forever inside a tool call), and -k so every privileged command
+# re-authenticates and therefore shows up in the audit log. Set
+# CLAUDE_SUDO_KEEP_CACHE=1 to use sudo's normal credential cache instead.
+set -uo pipefail
+
+self=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+real=
+IFS=: read -r -a _dirs <<<"${PATH:-}"
+for d in "${_dirs[@]}"; do
+  [ -n "$d" ] || continue
+  [ -x "$d/sudo" ] || continue
+  [ "$d/sudo" -ef "$self" ] && continue
+  real="$d/sudo"; break
+done
+if [ -z "$real" ]; then
+  for c in /usr/bin/sudo /bin/sudo /usr/local/bin/sudo; do
+    [ -x "$c" ] && { real=$c; break; }
+  done
+fi
+[ -n "$real" ] || { printf 'claude-sudo: cannot find the real sudo binary\n' >&2; exit 127; }
+
+# Be self-sufficient: -A is useless without SUDO_ASKPASS, and the helper always
+# sits next to this shim, so never depend on the caller having exported it.
+if [ -z "${SUDO_ASKPASS:-}" ]; then
+  _askpass="$(cd -- "$(dirname -- "$self")/.." && pwd)/claude-sudo-askpass"
+  [ -x "$_askpass" ] && export SUDO_ASKPASS="$_askpass"
+fi
+
+# Walk sudo's own options only — stop at `--` or at the command itself, so a
+# flag belonging to the command (`sudo grep -n foo`) is never mistaken for one
+# of sudo's. Hand straight through when the caller already chose how to
+# authenticate, or is only asking sudo about itself.
+passthru=0
+skip_value=0
+for a in "$@"; do
+  if [ "$skip_value" = 1 ]; then skip_value=0; continue; fi
+  case $a in
+    --) break ;;
+    -A|--askpass|-n|--non-interactive|-S|--stdin|-V|--version|--help)
+      passthru=1; break ;;
+    # options that consume the next argument
+    -[uUgphrtTRDC]|--user|--group|--prompt|--host|--other-user|--chdir|--chroot|--type|--role|--close-from)
+      skip_value=1; continue ;;
+    -*) continue ;;
+    *) break ;;
+  esac
+done
+
+[ "$passthru" = 1 ] && exec "$real" "$@"
+
+args=(-A)
+[ "${CLAUDE_SUDO_KEEP_CACHE:-0}" = 1 ] || args+=(-k)
+exec "$real" "${args[@]}" "$@"
