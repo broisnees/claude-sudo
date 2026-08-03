@@ -1,5 +1,8 @@
 # claude-sudo
 
+[![ci](https://github.com/broisnischal/claude-sudo/actions/workflows/ci.yml/badge.svg)](https://github.com/broisnischal/claude-sudo/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A **sudo mode** for Claude Code. While it is armed:
 
 - Claude stops asking you to approve every tool call.
