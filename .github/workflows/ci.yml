@@ -25,9 +25,13 @@ jobs:
 
       - name: Shellcheck
         run: |
+          # Executables get the full check.
           shellcheck -S warning -e SC1090,SC1091 \
             bin/claude-sudo bin/claude-sudo-statusline install.sh uninstall.sh \
-            hooks/*.sh lib/*.sh libexec/claude-sudo-askpass libexec/shim/sudo
+            hooks/*.sh libexec/claude-sudo-askpass libexec/shim/sudo
+          # Libraries are sourced, so SC2034 "appears unused" is a false positive
+          # by construction: their variables are consumed by the callers.
+          shellcheck -S warning -e SC1090,SC1091,SC2034 lib/*.sh
 
       - name: JSON manifests
         run: |
@@ -35,15 +39,21 @@ jobs:
           jq -e . .claude-plugin/plugin.json
           jq -e . .claude-plugin/marketplace.json
 
-      # An unlocked keyring, so the vault-backed tests run for real rather than
-      # taking the graceful skip.
+      # A session bus with an unlocked keyring, so the vault-backed tests run for
+      # real. The suite skips them gracefully when there is no keyring, which is
+      # right on a user's machine but would silently drop ~30 assertions here —
+      # so a skip is turned into a failure.
       - name: Smoke tests
         run: |
-          export $(dbus-launch)
-          echo -n '' | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1 || true
-          eval "$(echo -n '' | gnome-keyring-daemon --start --components=secrets 2>/dev/null)" || true
-          export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
-          bash tests/smoke.sh
+          set -o pipefail
+          dbus-run-session -- bash -c '
+            echo -n "" | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1
+            bash tests/smoke.sh
+          ' | tee /tmp/smoke.out
+          if grep -q "no usable keyring" /tmp/smoke.out; then
+            echo "::error::keyring-backed tests were skipped; CI must exercise them"
+            exit 1
+          fi
 
       - name: Version is consistent
         run: |
