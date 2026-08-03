@@ -6,7 +6,13 @@ set -uo pipefail
 
 ROOT=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/claude-sudo-test.XXXXXX")
-trap 'rm -rf "$TMP"; secret-tool clear service claude-sudo-selftest account tester host testhost 2>/dev/null || true' EXIT
+cleanup() {
+  rm -rf "$TMP"
+  # Whichever backend was used, leave nothing behind.
+  cs_vault_clear >/dev/null 2>&1 || true
+  secret-tool clear service claude-sudo-selftest account tester 2>/dev/null || true
+}
+trap cleanup EXIT
 
 export CLAUDE_SUDO_ROOT="$ROOT"
 export CLAUDE_SUDO_STATE="$TMP/state"
@@ -35,8 +41,8 @@ CS_HOSTNAME="$CLAUDE_SUDO_HOST"
 # The vault-backed tests need a keyring that actually answers, not merely a
 # secret-tool binary — a CI box without an unlocked keyring has the first but
 # not the second, and should skip rather than fail.
+# Backend-agnostic on purpose: CI may run this against pass rather than libsecret.
 vault_works() {
-  command -v secret-tool >/dev/null 2>&1 || return 1
   printf '%s' 'selftest-secret' | cs_vault_store >/dev/null 2>&1 || return 1
   [ "$(cs_vault_get 2>/dev/null)" = 'selftest-secret' ]
 }
@@ -265,6 +271,14 @@ if [ "$VAULT_OK" = 1 ]; then
 else
   printf '  \033[2m· skipped (no usable keyring)\033[0m\n'
 fi
+# Backend-independent, so it runs either way: every backend must treat the host
+# the same, which means the pass path is host-free unless a host was pinned.
+check "pass path is host-free by default" \
+  "$( unset CLAUDE_SUDO_HOST; . "$ROOT/lib/vault.sh"; cs_vault_pass_path )" \
+  "claude-sudo-selftest/tester"
+check "pass path honours a pinned host" \
+  "$( export CLAUDE_SUDO_HOST=pinned; . "$ROOT/lib/vault.sh"; cs_vault_pass_path )" \
+  "claude-sudo-selftest/tester@pinned"
 
 printf '\n\033[1maudit log\033[0m\n'
 contains "sudo commands are logged" "$(cat "$CLAUDE_SUDO_STATE/audit.log")" 'event=sudo-command'

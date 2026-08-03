@@ -40,7 +40,12 @@ cs_vault_backend() {
 
 cs_vault_set_backend() { cs_init_dirs; printf '%s\n' "$1" >"$CS_CONFIG/backend"; chmod 600 "$CS_CONFIG/backend"; }
 
-cs_vault_pass_path() { printf '%s/%s@%s' "$CS_SERVICE" "$CS_ACCOUNT" "$CS_HOSTNAME"; }
+# Same host semantics as libsecret: the hostname only takes part when it was
+# asked for, so a renamed machine does not orphan the entry here either.
+cs_vault_pass_path() {
+  if [ "$CS_HOST_STRICT" = 1 ]; then printf '%s/%s@%s' "$CS_SERVICE" "$CS_ACCOUNT" "$CS_HOSTNAME"
+  else printf '%s/%s' "$CS_SERVICE" "$CS_ACCOUNT"; fi
+}
 cs_vault_gpg_file() { printf '%s/vault.gpg' "$CS_STATE"; }
 cs_vault_label() { printf '%s: sudo password for %s@%s' "$CS_SERVICE" "$CS_ACCOUNT" "$CS_HOSTNAME"; }
 

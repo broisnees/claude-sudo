@@ -29,4 +29,4 @@ First release.
 - The keyring lookup does not require the hostname to match. A machine that
   renames itself (randomised or DHCP-assigned hostnames do) would otherwise
   orphan a stored password and report it as "no password stored".
-- 124 smoke tests that need neither your real password nor real sudo.
+- 126 smoke tests that need neither your real password nor real sudo.

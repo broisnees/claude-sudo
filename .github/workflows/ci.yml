@@ -14,7 +14,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq libsecret-tools gnome-keyring dbus-x11 shellcheck
+          sudo apt-get install -y -qq jq libsecret-tools gnome-keyring dbus-x11 shellcheck pass gnupg
 
       - name: Shell syntax
         run: |
@@ -39,19 +39,42 @@ jobs:
           jq -e . .claude-plugin/plugin.json
           jq -e . .claude-plugin/marketplace.json
 
-      # A session bus with an unlocked keyring, so the vault-backed tests run for
-      # real. The suite skips them gracefully when there is no keyring, which is
-      # right on a user's machine but would silently drop ~30 assertions here —
-      # so a skip is turned into a failure.
+      # The suite needs a secret store that actually answers. It skips those tests
+      # gracefully when there is none — right on a user's machine, but here it
+      # would silently drop ~37 assertions, so a skip is a failure.
+      #
+      # gnome-keyring headless is famously unreliable, so it is probed rather than
+      # assumed: if the probe fails, the deterministic `pass` backend takes over.
+      # Either way the same logic gets exercised.
+      - name: Secret store
+        run: |
+          mkdir -p ~/.local/share/keyrings
+          if dbus-run-session -- bash -c '
+                echo -n "ci" | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1
+                printf probe | secret-tool store --label=probe claude-sudo-probe yes >/dev/null 2>&1 \
+                  && [ "$(secret-tool lookup claude-sudo-probe yes 2>/dev/null)" = probe ]'; then
+            echo "backend=libsecret" >>"$GITHUB_ENV"
+            echo "libsecret answers; testing against gnome-keyring"
+          else
+            gpg --batch --quick-generate-key --passphrase '' ci@claude-sudo.test default default never
+            pass init ci@claude-sudo.test
+            echo "backend=pass" >>"$GITHUB_ENV"
+            echo "no usable keyring; testing against the pass backend"
+          fi
+
       - name: Smoke tests
         run: |
           set -o pipefail
-          dbus-run-session -- bash -c '
-            echo -n "" | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1
-            bash tests/smoke.sh
-          ' | tee /tmp/smoke.out
+          if [ "$backend" = libsecret ]; then
+            dbus-run-session -- bash -c '
+              echo -n "ci" | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1
+              bash tests/smoke.sh
+            ' | tee /tmp/smoke.out
+          else
+            CLAUDE_SUDO_BACKEND=pass bash tests/smoke.sh | tee /tmp/smoke.out
+          fi
           if grep -q "no usable keyring" /tmp/smoke.out; then
-            echo "::error::keyring-backed tests were skipped; CI must exercise them"
+            echo "::error::vault-backed tests were skipped; CI must exercise them"
             exit 1
           fi
 

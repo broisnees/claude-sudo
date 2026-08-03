@@ -258,7 +258,7 @@ libexec/shim/sudo             adds -A (and -k) to sudo
 lib/{common,vault,policy}.sh  state/audit, keyring backends, guardrails
 config/policy.default.conf    the shipped guardrails
 commands/sudo.md              the /sudo slash command
-tests/smoke.sh                124 checks, no real password or sudo needed
+tests/smoke.sh                126 checks, no real password or sudo needed
 ```
 
 Run the tests with `bash tests/smoke.sh` — isolated temp state, a dummy keyring
