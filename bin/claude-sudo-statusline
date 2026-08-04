@@ -6,8 +6,13 @@
 # recorded at $CS_CONFIG/statusline-inner by `claude-sudo statusline install`.
 # Fires several times a second — one jq pass, no keyring reads, no subshell loops.
 #
-#   [SUDO ⏵⏵]  armed: prompts are skipped and sudo authenticates from the keyring
-#   [SUDO ✗]   in an arming permission mode but no password stored — sudo will fail
+#   sudo    armed: prompts are skipped and sudo authenticates from the keyring
+#   sudo ✗  in an arming permission mode but no password stored — sudo will fail
+#
+# The badge is deliberately one quiet word. Set CLAUDE_SUDO_BADGE to override it,
+# so this survives a claude-sudo update:
+#   export CLAUDE_SUDO_BADGE='[SUDO ⏵⏵]'   # the original
+#   export CLAUDE_SUDO_BADGE_TIME=1        # append the minutes left
 set -uo pipefail
 
 _bin=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
@@ -27,14 +32,17 @@ fi
 cs_colors force
 badge=
 
+label=${CLAUDE_SUDO_BADGE:-sudo}
 if exp=$(cs_expiry "$sid" 2>/dev/null); then
-  if [ "$exp" = 0 ]; then badge="${CS_RED}[SUDO ⏵⏵]${CS_RST}"
-  else badge="${CS_RED}[SUDO ⏵⏵ $(( (exp - $(cs_now) + 59) / 60 ))m]${CS_RST}"; fi
+  badge="${CS_RED}${label}${CS_RST}"
+  if [ "$exp" != 0 ] && [ -n "${CLAUDE_SUDO_BADGE_TIME:-}" ]; then
+    badge="${CS_RED}${label} $(( (exp - $(cs_now) + 59) / 60 ))m${CS_RST}"
+  fi
 elif [ -n "$mode" ]; then
   # In a mode that would arm sudo mode, but it did not arm: say so, because the
   # built-in indicator will claim nothing needs approval while sudo still fails.
   while IFS= read -r m || [ -n "$m" ]; do
-    [ -n "$m" ] && [ "$m" != none ] && [ "$m" = "$mode" ] && { badge="${CS_DIM}[SUDO ✗]${CS_RST}"; break; }
+    [ -n "$m" ] && [ "$m" != none ] && [ "$m" = "$mode" ] && { badge="${CS_DIM}${label} ✗${CS_RST}"; break; }
   done < <(cs_arm_modes)
 fi
 

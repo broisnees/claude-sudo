@@ -17,7 +17,7 @@ Off by default. Armed per session, expires on its own, and never outlives the
 session that armed it.
 
 ```
-Shift+Tab  →  ⏵⏵ bypass permissions        [SUDO ⏵⏵ 480m]
+Shift+Tab  →  ⏵⏵ bypass permissions        sudo
 > install ripgrep system-wide
   ● sudo pacman -S --noconfirm ripgrep      (no prompt, no password question)
 ```
@@ -52,7 +52,7 @@ seventh entry called "sudo" cannot be added to the cycle. Instead claude-sudo
 
 Every hook payload carries `permission_mode`, so cycling into **bypass
 permissions** arms sudo mode, and cycling out of it disarms again. Shift+Tab is
-the switch, and the status line says `[SUDO ⏵⏵]` while it is live.
+the switch, and the status line says `sudo` while it is live.
 
 That entry is also the honest place for it: it is already the "don't ask me"
 mode. Riding on it makes it *safer* than bare bypass, because the policy below
@@ -101,7 +101,7 @@ cd ~/src/claude-sudo && ./install.sh --in-place
 
 It links `claude-sudo` and `csudo` into `~/.local/bin`, wires three hooks into
 `~/.claude/settings.json` (backing it up first, keeping the last five backups),
-installs the `/sudo` command and the `[SUDO ⏵⏵]` status line, asks for your sudo
+installs the `/sudo` command and the `sudo` status line badge, asks for your sudo
 password once — **in your own terminal**, never inside a Claude session — and
 asks whether to arm every session automatically.
 
@@ -191,7 +191,7 @@ What it does not protect against, stated plainly:
   armed session and your system — but it is real: hook denials are returned
   unchanged in every permission mode, including bypass.
 - Arming is one keystroke away. Shift+Tab is convenient by design, which also
-  means it is easy to land in by accident — the `[SUDO ⏵⏵]` badge exists so that
+  means it is easy to land in by accident — the `sudo` badge exists so that
   is always visible, and `claude-sudo modes off` removes the coupling entirely.
 - **Auto-arm removes the last speed bump on purpose.** With it on, a session is
   privileged before you have typed anything, so anything that can reach a session
@@ -252,7 +252,7 @@ replaces the defaults entirely. Format is TAB-separated
 
 ```
 bin/claude-sudo               CLI: setup, autoarm, on/off/status, audit, doctor
-bin/claude-sudo-statusline    the [SUDO ⏵⏵] badge, wrapping your own renderer
+bin/claude-sudo-statusline    the sudo badge, wrapping your own renderer
 hooks/gate.sh                 PreToolUse: mode coupling, policy, askpass rewrite
 hooks/session-start.sh        SessionStart: auto-arm, and tell Claude about it
 hooks/session-end.sh          SessionEnd: disarm, drop cached credentials

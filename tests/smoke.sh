@@ -166,10 +166,13 @@ if [ "$VAULT_OK" = 1 ]; then
   sl() { printf '%s' "$1" | bash "$ROOT/bin/claude-sudo-statusline" 2>/dev/null; }
   slin() { jq -cn --arg s "$1" --arg m "${2:-default}" '{session_id:$s,permission_mode:$m,cwd:"/tmp/proj",workspace:{current_dir:"/tmp/proj"}}'; }
   cs_arm sess-badge 30 manual >/dev/null
-  contains "shows SUDO when armed"        "$(sl "$(slin sess-badge default)")" 'SUDO ⏵⏵'
-  contains "shows the minutes left"       "$(sl "$(slin sess-badge default)")" 'm]'
+  contains "shows sudo when armed"        "$(sl "$(slin sess-badge default)")" 'sudo'
+  lacks    "and no countdown by default"  "$(sl "$(slin sess-badge default)")" '30m'
+  contains "countdown on request"         "$(CLAUDE_SUDO_BADGE_TIME=1 sl "$(slin sess-badge default)")" '30m'
+  contains "relabelled by CLAUDE_SUDO_BADGE" \
+           "$(CLAUDE_SUDO_BADGE='[SUDO ⏵⏵]' sl "$(slin sess-badge default)")" 'SUDO ⏵⏵'
   check   "silent when not armed"         "$(sl "$(slin sess-quiet default)")" ''
-  contains "warns in an arming mode with no password" "$(sl "$(slin sess-quiet bypassPermissions)")" 'SUDO ✗'
+  contains "warns in an arming mode with no password" "$(sl "$(slin sess-quiet bypassPermissions)")" 'sudo ✗'
   printf 'printf "INNER-%%s" ok\n' >"$CLAUDE_SUDO_CONFIG/statusline-inner"
   contains "runs your previous renderer" "$(sl "$(slin sess-badge default)")" 'INNER-ok'
   rm -f "$CLAUDE_SUDO_CONFIG/statusline-inner"

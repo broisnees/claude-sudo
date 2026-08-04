@@ -23,7 +23,9 @@ First release.
   silently allowed in a mode that never prompts, it is escalated to a refusal
   there instead.
 - **Audit log** of every privileged command, refusal and password hand-off.
-- **`[SUDO ⏵⏵]` status line badge** that wraps whatever renderer you already had.
+- **A `sudo` status line badge** that wraps whatever renderer you already had.
+  Relabel it with `CLAUDE_SUDO_BADGE`; `CLAUDE_SUDO_BADGE_TIME=1` appends the
+  minutes left.
 - `claude-sudo doctor` proves the whole chain by making sudo authenticate once.
 - One-line install that bootstraps itself, plus `claude-sudo update`.
 - The keyring lookup does not require the hostname to match. A machine that

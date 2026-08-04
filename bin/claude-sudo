@@ -210,7 +210,7 @@ statusline_install() {
   jq --arg c "$cmd" '.statusLine = {type:"command", command:$c}' "$CS_SETTINGS" >"$tmp" \
     && jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; cs_die "failed to patch statusLine"; }
   cat "$tmp" >"$CS_SETTINGS" && rm -f "$tmp"
-  ok "statusline wired — sudo mode shows as [SUDO ⏵⏵]"
+  ok "statusline wired — sudo mode shows as a red sudo"
   cs_log statusline-install
 }
 
@@ -295,7 +295,7 @@ cmd_status() {
   else
     info "Shift+Tab coupling disabled — arm with /sudo on"
   fi
-  if statusline_wired; then ok "statusline shows [SUDO ⏵⏵]"; else info "statusline badge off — run: claude-sudo statusline install"; fi
+  if statusline_wired; then ok "statusline shows sudo when armed"; else info "statusline badge off — run: claude-sudo statusline install"; fi
   info "install root: $CS_ROOT"
   info "audit log:    $CS_AUDIT ($( [ -f "$CS_AUDIT" ] && wc -l <"$CS_AUDIT" || printf 0) lines)"
   info "policy:       $(cs_policy_file)"

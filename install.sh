@@ -10,7 +10,7 @@
 #   ./install.sh --no-password    wire only; store the password later
 #   ./install.sh --prefix DIR     install somewhere else (or set CLAUDE_SUDO_PREFIX)
 #   ./install.sh --bindir DIR     put the claude-sudo symlink somewhere specific
-#   ./install.sh --no-statusline  skip the [SUDO ⏵⏵] status line badge
+#   ./install.sh --no-statusline  skip the sudo status line badge
 set -euo pipefail
 
 REPO_URL="${CLAUDE_SUDO_REPO:-https://github.com/broisnischal/claude-sudo}"
