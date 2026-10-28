@@ -128,7 +128,7 @@ claude-sudo status         # armed? auto-arm? backend? wiring? all of it
 claude-sudo doctor         # full check, makes sudo really authenticate once
 claude-sudo audit -f       # follow every privileged command as it happens
 claude-sudo autoarm on     # arm every new session (off | status)
-claude-sudo policy         # the guardrails currently in force
+claude-sudo policy         # the guardrails currently in force (off | on | add | test | edit)
 claude-sudo modes          # which Shift+Tab modes arm sudo mode
 claude-sudo passwd         # replace the stored password
 claude-sudo forget         # delete it
@@ -222,10 +222,33 @@ Asks: `/etc/sudoers` and other credential files, `passwd`/`useradd`/`usermod`,
 SSH keys, firewall rules, `systemctl mask|disable|stop`, package *removal*,
 partition and LVM tools, `crontab`.
 
-`claude-sudo policy` prints the active set. To change it, copy
-`config/policy.default.conf` to `~/.config/claude-sudo/policy.conf` — your file
-replaces the defaults entirely. Format is TAB-separated
-`action<TAB>extended-regex<TAB>reason`, first match wins.
+`claude-sudo policy` prints the active set, with each rule's name.
+
+### Per-user overrides
+
+Each OS user can layer their own overrides on top of the shipped defaults in
+`~/.config/claude-sudo/policy.conf`. The defaults keep updating underneath, so
+new guardrails still reach me after `claude-sudo update`.
+
+```bash
+claude-sudo policy off firewall        # switch one shipped rule off
+claude-sudo policy off ask             # every ask rule off: only the denies remain
+claude-sudo policy on firewall         # undo
+claude-sudo policy add deny 'docker[[:space:]]+system[[:space:]]+prune' 'wipes every image'
+claude-sudo policy test sudo ufw enable   # what would the gate decide?
+claude-sudo policy edit                # open the file in $EDITOR
+claude-sudo policy reset               # back to the defaults (keeps a .bak)
+```
+
+The file is TAB-separated. `off<TAB><name>` switches a shipped rule off, and
+`ask`, `deny` or `all` in place of a name covers a whole group. Every other line
+is a rule: `deny<TAB>extended-regex<TAB>reason` (or `ask`). A deny wins over an
+ask wherever either comes from, so an `ask` rule of mine can't hide a deny
+chained into the same command (`crontab -l; rm -rf /`).
+
+`off all` drops every shipped rule and leaves only mine. That's how a
+`policy.conf` worked in 1.0.0, so a full copy of the old defaults needs
+`off<TAB>all` added to keep behaving the same.
 
 ## Configuration
 

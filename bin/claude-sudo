@@ -36,7 +36,8 @@ claude-sudo — sudo mode for Claude Code
   passwd [--stdin]                   replace the stored password
   forget                             delete the stored password
   audit [-n N] [-f]                  audit log (every privileged command)
-  policy                             show the active guardrails
+  policy [show|test|off|on|add|edit|reset]
+                                     guardrails: defaults + my overrides
   doctor                             full check, authenticates against sudo once
   hooks install|uninstall|status     manage the Claude Code wiring
   autoarm on|off|status              arm every new session automatically
@@ -298,7 +299,7 @@ cmd_status() {
   if statusline_wired; then ok "statusline shows sudo when armed"; else info "statusline badge off — run: claude-sudo statusline install"; fi
   info "install root: $CS_ROOT"
   info "audit log:    $CS_AUDIT ($( [ -f "$CS_AUDIT" ] && wc -l <"$CS_AUDIT" || printf 0) lines)"
-  info "policy:       $(cs_policy_file)"
+  info "policy:       $( [ -f "$CS_POLICY_USER" ] && printf "defaults + %s" "$CS_POLICY_USER" || printf "shipped defaults")"
   local n; n=$(cs_reap; ls -1 "$CS_SESSIONS" 2>/dev/null | wc -l)
   info "armed sessions: $n"
   printf '\n'
@@ -429,12 +430,114 @@ cmd_audit() {
   else tail -n "$n" "$CS_AUDIT" | cs_audit_fmt; fi
 }
 
-cmd_policy() {
-  local f; f=$(cs_policy_file)
-  printf 'active policy: %s\n\n' "$f"
-  grep -vE '^\s*(#|$)' "$f" | while IFS=$'\t' read -r action re reason; do
-    printf '  %-4s %s\n       \033[2m%s\033[0m\n' "$action" "$reason" "$re"
+policy_usage() {
+  cat <<'EOF'
+claude-sudo policy: guardrails, layered: shipped defaults + your overrides
+
+  policy [show]                  active rules, with names and where each came from
+  policy test <command>          what the gate would decide for <command>
+  policy off <name|ask|deny|all> switch shipped rules off for you
+  policy on <name|ask|deny|all>  undo an `off`
+  policy add deny|ask <regex> [reason]
+                                 add a rule of your own
+  policy edit                    open your override file in $EDITOR
+  policy reset                   drop your overrides (kept as policy.conf.bak)
+
+Overrides live in ~/.config/claude-sudo/policy.conf, one per OS user. A deny
+always wins over an ask, wherever it comes from.
+EOF
+}
+
+policy_init_user() {
+  cs_init_dirs
+  [ -f "$CS_POLICY_USER" ] && return 0
+  cat >"$CS_POLICY_USER" <<'EOF'
+# claude-sudo: my policy overrides, layered on top of the shipped defaults.
+# TAB-separated. `claude-sudo policy` lists the shipped rule names.
+#
+#   off<TAB>firewall                       switch one shipped rule off
+#   off<TAB>ask                            switch every shipped ask rule off
+#   deny<TAB>regex<TAB>reason              add a rule (ask works the same way)
+EOF
+}
+
+policy_show() {
+  local i act name re why tag n=0
+  _cs_policy_load
+  printf 'defaults:  %s\n' "$CS_POLICY_DEFAULT"
+  if [ -f "$CS_POLICY_USER" ]; then printf 'overrides: %s\n\n' "$CS_POLICY_USER"
+  else printf 'overrides: none (claude-sudo policy edit)\n\n'; fi
+  for i in "${!CS_R_RE[@]}"; do
+    tag=; [ "${CS_R_SRC[i]}" = user ] && tag=" ${CS_YELLOW}(mine)${CS_RST}"
+    printf '  %-4s %-17s %s%s\n       %s%s%s\n' "${CS_R_ACT[i]}" "${CS_R_NAME[i]:--}" \
+      "${CS_R_WHY[i]}" "$tag" "$CS_DIM" "${CS_R_RE[i]}" "$CS_RST"
   done
+  # Shipped rules this user switched off, so nothing disappears silently.
+  while IFS=$'\t' read -r act re why; do
+    case $act in deny:*|ask:*) ;; *) continue ;; esac
+    name=${act#*:}; act=${act%%:*}
+    case $CS_R_OFF in *" all "*|*" $act "*|*" $name "*) ;; *) continue ;; esac
+    [ "$n" = 0 ] && printf '\n  %sswitched off by you:%s\n' "$CS_BOLD" "$CS_RST"
+    n=$((n+1))
+    printf '  %s%-4s %-17s %s%s\n' "$CS_DIM" "$act" "$name" "$why" "$CS_RST"
+  done <"$CS_POLICY_DEFAULT"
+}
+
+cmd_policy() {
+  local sub=${1:-show}; shift 2>/dev/null || true
+  case $sub in
+    show|list) policy_show ;;
+    test)
+      [ $# -gt 0 ] || cs_die "policy test: expected a command"
+      local v r; IFS=$'\t' read -r v r <<<"$(cs_policy_check "$*")"
+      printf '%s%s\n' "$v" "${r:+  ($r)}" ;;
+    off|on)
+      local key=${1:-}
+      [ -n "$key" ] || cs_die "policy $sub: expected a rule name, or ask|deny|all"
+      case " ask deny all $(cs_policy_names | tr '\n' ' ')" in
+        *" $key "*) ;; *) cs_die "policy $sub: no shipped rule named '$key' (see: claude-sudo policy)" ;;
+      esac
+      if [ "$sub" = off ]; then
+        policy_init_user
+        grep -qxF "off	$key" "$CS_POLICY_USER" || printf 'off\t%s\n' "$key" >>"$CS_POLICY_USER"
+        cs_log policy-off "rule=$key"
+        ok "'$key' is off for you"
+      else
+        if [ -f "$CS_POLICY_USER" ]; then
+          grep -vxF "off	$key" "$CS_POLICY_USER" >"$CS_POLICY_USER.tmp"
+          mv -f "$CS_POLICY_USER.tmp" "$CS_POLICY_USER"
+        fi
+        cs_log policy-on "rule=$key"
+        ok "'$key' is back on"
+        _cs_policy_load
+        case $CS_R_OFF in *" ask "*|*" deny "*|*" all "*)
+          [ "$key" = ask ] || [ "$key" = deny ] || [ "$key" = all ] ||
+            warn_ "a group switch (off ask|deny|all) still covers it, see: claude-sudo policy" ;;
+        esac
+      fi ;;
+    add)
+      local act=${1:-} re=${2:-}; shift 2 2>/dev/null || true
+      case $act in deny|ask) ;; *) cs_die "policy add: expected deny|ask <regex> [reason]" ;; esac
+      [ -n "$re" ] || cs_die "policy add: expected a regex"
+      case $re in *$'\t'*|*$'\n'*) cs_die "policy add: the regex cannot contain a tab or newline" ;; esac
+      # =~ returns 2 for a regex it cannot compile.
+      [[ x =~ $re ]] 2>/dev/null; [ $? -ne 2 ] || cs_die "policy add: not a valid extended regex: $re"
+      policy_init_user
+      printf '%s\t%s\t%s\n' "$act" "$re" "${*:-my rule}" >>"$CS_POLICY_USER"
+      cs_log policy-add "action=$act" "re=$re"
+      ok "added: $act $re" ;;
+    edit)
+      policy_init_user
+      "${VISUAL:-${EDITOR:-vi}}" "$CS_POLICY_USER" ;;
+    reset)
+      if [ -f "$CS_POLICY_USER" ]; then
+        mv -f "$CS_POLICY_USER" "$CS_POLICY_USER.bak"
+        cs_log policy-reset
+        ok "overrides dropped, back to the shipped defaults (old file: $CS_POLICY_USER.bak)"
+      else info "no overrides to drop"; fi ;;
+    help|-h|--help) policy_usage ;;
+    *) policy_usage; exit 1 ;;
+  esac
 }
 
 # --------------------------------------------------------------------- main ---
@@ -485,7 +588,7 @@ EOF
     if cs_vault_clear; then cs_log vault-clear; ok "stored password deleted from the $(cs_vault_backend) keyring"
     else cs_die "nothing to delete, or the keyring refused"; fi ;;
   audit) cmd_audit "$@" ;;
-  policy) cmd_policy ;;
+  policy) cmd_policy "$@" ;;
   doctor) cmd_doctor ;;
   hooks)
     case ${1:-status} in

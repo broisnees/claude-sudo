@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Per-user policy overrides that layer on the defaults.**
+  `~/.config/claude-sudo/policy.conf` no longer replaces the shipped policy. It
+  switches named rules off (`off firewall`, or `off ask` for every ask rule) and
+  adds rules of its own, while the defaults keep updating underneath. New
+  `claude-sudo policy off|on|add|test|edit|reset` subcommands manage it.
+- A deny now beats an ask regardless of rule order, so an added `ask` can't hide
+  a deny chained into the same command.
+- **Breaking:** a 1.0.0 `policy.conf` that copied the defaults now stacks on top
+  of them. Add `off<TAB>all` to keep the old replace-everything behaviour.
+
 ## 1.0.0
 
 First release.

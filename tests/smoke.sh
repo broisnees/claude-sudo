@@ -303,6 +303,31 @@ contains "status names the backend" "$(cli status)" "$(cs_vault_backend)"
 contains "status shows arming modes" "$(cli status)" 'bypassPermissions'
 check "policy rule counts"          "$(cs_policy_count)" '13 9'
 contains "policy list is readable"  "$(cli policy)" 'rm targeting the filesystem root'
+contains "policy list shows names"  "$(cli policy)" 'firewall'
+
+printf '\n\033[1mper-user policy\033[0m\n'
+check "ask before overrides"         "$(verdict 'sudo ufw allow 22')"                  ask
+cli policy off firewall >/dev/null
+check "one shipped rule switched off" "$(verdict 'sudo ufw allow 22')"                 allow
+check "others stay on"               "$(verdict 'crontab -e')"                         ask
+check "off is idempotent"            "$(cli policy off firewall >/dev/null; grep -c '^off' "$CLAUDE_SUDO_CONFIG/policy.conf")" 1
+cli policy on firewall >/dev/null
+check "on undoes off"                "$(verdict 'sudo ufw allow 22')"                  ask
+cli policy off ask >/dev/null
+check "off ask drops every ask"      "$(cs_policy_count)" '13 0'
+check "denies survive off ask"       "$(verdict 'sudo reboot')"                        deny
+contains "switched-off rules listed" "$(cli policy)" 'switched off by you'
+cli policy add deny 'docker[[:space:]]+system[[:space:]]+prune' 'wipes every image' >/dev/null
+check "user rule added"              "$(verdict 'docker system prune -af')"            deny
+contains "test explains itself"      "$(cli policy test docker system prune)"          'wipes every image'
+check "user ask cannot shadow a deny" "$(cli policy add ask 'crontab' x >/dev/null; verdict 'crontab -l; sudo rm -rf /')" deny
+contains "bad regex refused"         "$(cli policy add deny '([')"                     'not a valid'
+contains "unknown rule refused"      "$(cli policy off nope)"                          "no shipped rule named 'nope'"
+printf 'off\tall\n' >>"$CLAUDE_SUDO_CONFIG/policy.conf"
+check "off all leaves only my rules" "$(cs_policy_count)" '1 1'
+cli policy reset >/dev/null
+check "reset restores the defaults"  "$(cs_policy_count)" '13 9'
+check "reset keeps a backup"         "$([ -f "$CLAUDE_SUDO_CONFIG/policy.conf.bak" ] && echo y)" y
 # A plugin checkout must not also patch settings.json.
 ( CLAUDE_SUDO_ROOT="$HOME/.claude/plugins/claude-sudo"; . "$ROOT/lib/common.sh"
   cs_is_plugin_install ) && t_ok "plugin install is detected" || t_bad "plugin install is detected"
